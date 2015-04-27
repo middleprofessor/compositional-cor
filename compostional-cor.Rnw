@@ -1,0 +1,605 @@
+\documentclass{article}
+
+\begin{document}
+
+<<housekeeping>>=
+library(data.table)
+library(ggplot2)
+library(mvtnorm)
+library(SpiecEasi)
+library(vegan) # decostand
+
+reverse.lower.tri <- function(p,r){
+  R <- diag(p) 
+  R[lower.tri(R, diag=FALSE)] <- r 
+  R <- R + t(R) - diag(diag(R))
+  return(R)
+}
+
+standardize <- function(X){
+  # the scale function does not divide by the standard deviation if the data are not centered. This function does.
+  return(scale(X,center=FALSE,scale=apply(X,2,sd,na.rm=TRUE)))
+}
+
+geom_mean <- function(x){
+  xbar <- exp(mean(log(x)))
+  return(xbar)
+}
+
+mrs_gm <- function(X){ # median ratio size using the geometric mean
+  col_gm <- apply(X,2,geom_mean)
+  X2 <- t(t(X)/col_gm)
+  est_size <- apply(X2,1,median)
+  return(est_size)
+}
+
+mrs_am <- function(X){ # median ratio size using the arithmetic mean
+  col_mean <- apply(X,2,mean)
+  X2 <- t(t(X)/col_mean)
+  est_size <- apply(X2,1,median)
+  return(est_size)
+}
+
+general_size_vector <- function(R,method='min_range'){
+  # returns the eigenvector of the correlation matrix R identified as the general size vector
+  p <- dim(R)[2]
+  E <- eigen(R)$vectors
+	coef_sd <- apply(E,2,sd)
+	vec_range <- apply(E,2,function(x) max(x)-min(x))
+	min_range_vector <- which(vec_range==min(vec_range))  
+	min_sd_vector <- which(coef_sd==min(coef_sd))  
+	all_pos_vector <- which(apply(E,2,function(x) abs(sum(sign(x))))==p)
+  max_sum_vector <- which(abs(apply(E,2,sum))==max(abs(apply(E,2,sum))))
+  
+	ID <- max_sum_vector
+  if(t(E[,ID])%*%rep(1,p) < 0){E[,ID] <- -E[,ID]}
+  return(E[,ID])
+}
+
+fake_data <- function(n=100,Sigma=diag(rep(1,10)),mu=rep(0,10),sd=rep(1,10)){
+  X <- rmvnorm(n, sigma=sigma)
+  x_bar <- apply(X,2,mean)
+}
+
+gwfa <- function(X,which_size='pc1',bc='none',standardize=FALSE){ # generalized wright factor analysis
+   # X is the input n x p matrix of p traits for n individuals
+  # X cannot be row normalized
+  # method: pc1=general size eigenvector, tss = sum size vector, mrs 
+  # fit is the returned object from fit_bias2
+  # bc is "bias-correct", which can be 'none', 'wright', or 'bm' where bm = bias-model
+  # b is the row of b_table for p=p
+  if(standardize==TRUE){X <- standardize(X)}
+  R <- cor(X,use='pairwise.complete.obs')
+  p <- dim(X)[2]
+  
+  if(which_size=='pc1'){
+    e <- general_size_vector(R)
+    est_size <- X%*%e # scores on "general size" PC, this is the "general size factor"
+  }
+  if(which_size=='tss'){
+    est_size <- apply(X,1,sum) # row counts
+  }
+  if(which_size=='gms'){# assumes X is lognormal
+    est_size <- apply(X,1,geom_mean) # geometric mean   
+  }
+  if(which_size=='clr'){# assumes X is lognormal
+    gms <- apply(X,1,geom_mean)
+    X_gms <- X/gms
+    # apply(X.gms,1,geom_mean)# check
+    est_size <- apply(log(X_gms),1,median)
+  }
+  if(which_size=='mrs_gm'){# assumes X is lognormal
+    est_size <- mrs_gm(X) # median ratio size using the geometric mean
+  }
+  if(which_size=='mrs_am'){# assumes X is Normal
+    est_size <- mrs_am(X) # median ratio size using the arithmetic mean
+  }
+  
+  # alpha_hat is the correlation between size and X so sqrt of this is alpha_hat
+  alpha_hat <- t(cor(est_size,X,use='pairwise.complete.obs')) # loadings as COR(PC1, X)
+  sigma_hat <- apply(X,2,function(x) sd(x,na.rm=TRUE))
+  bc_alpha <- NULL
+  R_gs <- alpha_hat%*%t(alpha_hat) # the expected correlation due to general size
+
+  if(bc=='none'){
+    R_resid <- R - R_gs   
+  }
+  if(bc=='wright'){
+    # this works if the general size vector is all positive but as it moves toward random the mean will move to zero. The ratio wc should vary between 1 and r_bar/r_gs_bar
+    # if general size has an effect than R_gs_bar < R_bar, so wc > 1 and R_resid will be smaller than if not bias-corrected.
+    r_gs_bar <- max(0,mean(R_gs[lower.tri(R_gs)]))
+    max_r_gs_bar <- mean(abs(R_gs[lower.tri(R_gs)])) # the expected mean corelation due to alpha if all alpha > 0
+    r_bar <- max(0,mean(R[lower.tri(R)]))
+    max_r_bar <- mean(abs(R[lower.tri(R)])) # the expected mean corelation if all r > 0
+    
+    frac_gs_bar <- r_gs_bar/max_r_gs_bar
+    wc <- (1-frac_gs_bar)*1 + frac_gs_bar*(max_r_bar/max_r_gs_bar) # bias correction ratio due to Wright 1932 modified to vary between 1 and 
+    
+    R_gs_bc <- R_gs * wc # Wright's bias-correct correlations due to general size
+    R_resid <- R - R_gs_bc
+    
+    # wright's bias-corrected alpha
+    bc_alpha <- alpha_hat*sqrt(wc)
+    #R_gs_bc2 <- bc_alpha%*%t(bc_alpha) # check!
+    
+  }
+  
+  return(list(R_resid=R_resid,bc_alpha=bc_alpha,alpha_hat=alpha_hat))
+}
+
+size_free_X <- function(X,R.sf_hat,do_cov=FALSE){
+  # X is the column standardized (variance) data
+  # R.sf_hat is the size-adjusted correlaiton matrix of X
+  X.s <- scale(X)
+  res <- eigen(cor(X))
+  E <- res$vectors
+  L <- res$values
+  scores <- X.s%*%E%*%diag(1/sqrt(L)) # standardized scores acts like a matrix of random X
+#  loads <- cor(X.s,scores[,1])[,1]
+#  loads2 <- E[,1]*sqrt(L[1])
+#  data.table(e1=E[,1],loads=loads,loads2=loads2) #check
+  diag(R.sf_hat) <- 1.0
+  res <- eigen(R.sf_hat)
+  E <- res$vectors
+  L <- res$values
+  p <- max(which(L>0))
+  X.sf_hat <- scores[,1:p]%*%t(E[,1:p]%*%diag(sqrt(L[1:p])))
+  #R.test <- cor(X.sf_hat)           
+  #vec1 <- R.sf_hat[lower.tri(R.sf_hat)]
+  #vec2 <- R.test[lower.tri(R.test)]
+  #data.table(vec1=vec1,vec2=vec2)
+  #cor(vec1,vec2)
+  if(do_cov==TRUE){X.sf_hat <- t(t(X.sf_hat%*%diag(apply(X,2,sd)))  + apply(X,2,mean))}
+  return(X.sf_hat)
+}
+
+vector_r <- function(v1,v2){
+  vector_r <- t(v1)%*%v2/sqrt(t(v1)%*%v1)/sqrt(t(v2)%*%v2)
+  return(vector_r[1,1])
+}
+
+error_from_correlation_matrix <- function(R_est,R_known){
+  error <- R_est[lower.tri(R_est)] - R_known[lower.tri(R_known)]
+  return(error)
+}
+
+
+boxplot.95 <- function(x){
+  out <- quantile(x,probs=c(0.025,0.25,0.5,0.75,0.975))
+  names(out) <- c('ymin','lower','middle','upper','ymax')
+	return(out)
+}
+
+@
+
+
+<<explore SpiecEasi>>=
+init_SpiecEasi <- function(){
+  # phyloseq from bioconductor must be installed using the next two lines
+  # source("http://bioconductor.org/biocLite.R")
+  # biocLite("phyloseq")
+  library(devtools)
+  install_github("zdk123/SpiecEasi")
+  library(SpiecEasi)
+}
+
+read_me_function <- function(){
+  #Lets simulate some multivariate data under zero-inflated negative binomial model, based on (high depth/count) round 1 of the American gut project, with a sparse network. The basic steps are
+
+#1. load the data and normalize counts to to common scale (min depth)
+#2. fit count margins to the model
+#3. generate a synthetic network
+#4. generate some synthetic data
+#5. clr transformation
+#6. inverse covariance estimation
+#7. stability selection
+#8. evaluate performance
+#Obviously, for real data, skip 1-4.
+
+data(amgut1.filt)
+depths <- rowSums(amgut1.filt)
+amgut1.filt.n <- t(apply(amgut1.filt, 1, norm_to_total))
+amgut1.filt.cs <- round(amgut1.filt.n * min(depths))
+
+d <- ncol(amgut1.filt.cs)
+n <- nrow(amgut1.filt.cs)
+e <- d
+
+#Synthesize the data
+set.seed(10010)
+graph <- make_graph('cluster', d, e)
+Prec  <- graph2prec(graph)
+Cor   <- cov2cor(prec2cov(Prec))
+
+X <- synth_comm_from_counts(amgut1.filt.cs, mar=2, distr='zinegbin', Sigma=Cor, n=n)
+
+#the main SPIEC-EASI pipeline: Data transformation, sparse invserse covariance estimation and model selection
+
+se.est <- spiec.easi(X, method='mb', lambda.min.ratio=1e-2, nlambda=15)
+#examine ROC over lambda path and PR over the stars index for the selected graph
+
+huge::huge.roc(se.est$path, graph)
+stars.pr(se.est$merge[[se.est$opt.index]], graph)
+# stars selected final network under: se.est$refit
+#The above example does not cover all possible options and parameters. For example, other generative network models are available, the lambda.min.ratio (the scaling factor that determines the minimum sparsity/lambda parameter) shown here might not be right for your dataset, and its possible that you'll want more repetitions for stars selection.
+
+I will update this README with more 'advanced' usage.
+}
+
+my_toy_function <- function(){
+  # from the SpiecEasi GitHub page
+  data(amgut1.filt)
+  depths <- rowSums(amgut1.filt)
+  amgut1.filt.n <- t(apply(amgut1.filt, 1, norm_to_total))
+  amgut1.filt.cs <- round(amgut1.filt.n * min(depths))
+
+  hist(apply(amgut1.filt,1,sum))
+  hist(apply(amgut1.filt.n,1,sum))
+  hist(apply(amgut1.filt.cs,1,sum))
+
+  d <- ncol(amgut1.filt.cs)
+  n <- nrow(amgut1.filt.cs)
+  e <- d
+  
+  set.seed(10010)
+  graph <- make_graph('cluster', d, e)
+  Prec  <- graph2prec(graph)
+  Cor   <- cov2cor(prec2cov(Prec))
+  res <- eigen(Cor)
+  cor(res$vectors[,1],)
+  
+  X.zinegbin <- synth_comm_from_counts(amgut1.filt.cs, mar=2, distr='zinegbin', Sigma=Cor, n=10^4,retParams=TRUE)
+    res <- eigen(Cor)
+  cor(res$vectors[,1],)
+
+  X.zinegbin$params
+  attributes(X.zinegbin)
+  X.lognorm <- synth_comm_from_counts(amgut1.filt.cs.1, mar=2, distr='zinegbin', Sigma=Cor, n=10^4)
+  mean(apply(amgut1.filt.cs,1,sum))
+  mean(apply(X.zinegbin,1,sum))
+  mean(apply(X.lognorm,1,sum))
+  hist(apply(X.zinegbin,1,sum))
+  hist(apply(X.lognorm,1,sum))
+  error <- error_from_correlation_matrix(cor(X.zinegbin),Cor)
+  hist(error)
+  res <- eigen(cor(X.zinegbin))
+  loadings <- cor(X.zinegbin%*%res$vectors[,1],X.zinegbin)
+  mean(loadings)
+  sd(loadings)
+  max(loadings)
+  min(loadings)
+  
+  se.est <- spiec.easi(X, method='mb', lambda.min.ratio=1e-2, nlambda=15)
+  huge::huge.roc(se.est$path, graph)
+  stars.pr(se.est$merge[[se.est$opt.index]], graph)
+  # stars selected final network under: se.est$refit
+}
+
+test_Cor <- function(){
+  e_array <- c(1,5,10,20,30,40,50)
+  niter <- 25
+  res_table <- data.table(NULL)
+  for(e_param in e_array){
+    for(iter in 1:niter){
+      e <- round(p * e_param,0) #number of edges, Kurtz sets this to p for all simulations
+      #        seed_no <- seed_no+1
+      #        set.seed(seed_list[seed_no])
+      graph <- make_graph('cluster', p, e) #scale_free, cluster
+      Prec  <- graph2prec(graph,targetCondition=100) # Kurtz uses targetCondition=c(10,100)
+      Cor   <- cov2cor(prec2cov(Prec))
+      median_Cor <- median(abs(Cor[lower.tri(Cor)]))
+      frac_zero <- length(Cor[lower.tri(Cor)][abs(Cor[lower.tri(Cor)])<0.01])/length(Cor[lower.tri(Cor)])
+      res_table <- rbind(res_table,data.table(e=e_param,median_Cor=round(median_Cor,3),frac_zero=round(frac_zero,3)))
+    }
+  }
+ res_table[,list(median=median(median_Cor),frac_zero=median(frac_zero)),by=e]
+}
+
+test_bigN <- function(){
+  data(amgut1.filt)
+  depths <- rowSums(amgut1.filt)
+  amgut1.filt.n <- t(apply(amgut1.filt, 1, norm_to_total))
+  amgut1.filt.cs <- round(amgut1.filt.n * min(depths))
+  microdat <- amgut1.filt.cs
+  distribution <- 'zinegbin'
+  p <- ncol(microdat)
+  n <- nrow(microdat)
+  e_param <- 5 #1, 5, 20
+  e <- round(p * e_param,0)
+  niter <- 25
+  big_N <- 5*10^5
+  graph <- make_graph('cluster', p, e) #scale_free, cluster
+  Prec  <- graph2prec(graph,targetCondition=100) # Kurtz uses targetCondition=c(10,100)
+  Cor   <- cov2cor(prec2cov(Prec))
+  X.sf <- synth_comm_from_counts(microdat, mar=2, distr=distribution, Sigma=Cor, n=big_N,retParams=FALSE) # the big N is to get a "true" R in the non-normal space with little sample error
+  write.table(X.sf,'X_zinegbin.n=5e5.txt',sep='\t')
+  R_true <- cor(X.sf)
+  res_table <- data.table(NULL)
+  for(sample_N in c(500,5000,50000)){
+    for(iter in 1:niter){
+      X <- X.sf[sample(1:big_N,sample_N),]
+      R <- cor(X)
+      err <- error_from_correlation_matrix(R,R_true)
+      RMSE <- sqrt(mean(err^2))
+      res_table <- rbind(res_table,data.table(sample_N=sample_N,RMSE=RMSE))
+    }
+  }
+  res_table[,list(rmse=mean(RMSE)),by=sample_N]
+}
+
+simulate_abundance <- function(
+  do_methods = c('clr','mrs_gm','wfa1','wfa2','sgs','sparcc','raw','perc','samp')
+  ){
+
+  # two data sets
+  data(amgut1.filt)
+  depths <- rowSums(amgut1.filt)
+  amgut1.filt.n <- t(apply(amgut1.filt, 1, norm_to_total))
+  amgut1.filt.cs <- round(amgut1.filt.n * min(depths))
+  
+  
+  study_1925.raw <- read.table('microbiom.txt',header=TRUE,sep='\t')
+  row.names(study_1925.raw) <- study_1925.raw[,1]
+  study_1925.raw <- study_1925.raw[,-1] # remove row names from col 1
+  study_1925.raw <- study_1925.raw[,1:207] # remove junk in last colum
+  # transpose to sites in rows and OTUs in columns
+  study_1925.raw <- t(study_1925.raw)
+  n_sites <- dim(study_1925.raw)[1]
+  n_OTU <- dim(study_1925.raw)[2]
+  sites_with_OTU <- apply(ifelse(study_1925.raw==0,0,1),2,sum) # for each OTU gives the number of sites containing that OTU
+  cols_inc <- which(sites_with_OTU/n_sites > .37) # Kurtz retained OTUs only if occurring in > 37% of sites
+  total_reads <- apply(study_1925.raw[,cols_inc],1,sum) # row sums (reads per site) = site "size"
+  rows_inc <- which(total_reads > quantile(total_reads,.25)) # Kurtz removed the lower 25% of sites
+  study_1925.filt <- study_1925.raw[rows_inc,cols_inc]
+  depths <- rowSums(study_1925.filt)
+  study_1925.filt.n <- t(apply(study_1925.filt, 1, norm_to_total))
+  study_1925.filt.cs <- round(study_1925.filt.n * min(depths))
+  # the two datasets are overlapping
+  dim(amgut1.filt.cs) # 289 sites X 127 OTU
+  dim(study_1925.filt.cs) # 155 sites X 227 OTU
+  
+ 
+  microdat.raw <- amgut1.filt
+  microdat <- amgut1.filt.cs
+  
+  # some stats
+  R.microdat <- cor(microdat.raw)
+  
+  #foldsize difference between largest and smallest site for raw and normalized
+  size <- apply(microdat.raw,1,sum)
+  fold.microdat <- max(size)/min(size)
+  size <- apply(microdat,1,sum)
+  fold.microdat.n <- max(size)/min(size)
+
+
+  # read data with OTU in rows and sites in columns
+  set.seed( as.integer((as.double(Sys.time())*1000+Sys.getpid()) %% 2^31) )
+  microdat <- amgut1.filt.cs
+  p <- ncol(microdat)
+  n <- nrow(microdat)
+  bigN <- 10^3 # N to get a "true" R
+  do_methods <- c('wfa1','wfa2','sparcc','pearson','perc','samp')
+  do_methods <- c('wfa1','sparcc','pearson','perc')
+  do_network <- TRUE
+  do_hist <- FALSE
+  distribution <- 'lognorm' # zinegbin, lognorm
+  alpha_array <- c(0,.4,.7)
+  s_array <- c(1,1.5,2)
+  e_array <- c(1,5,20)
+  niter <- 1
+  alpha_array <- c(0,.7)
+  s_array <- c(1,2)
+  e_array <- c(1)
+  #set.seed(10010)
+  seed_list <- as.integer(runif(1000,1,10^5))
+  res_table <- data.table(NULL)
+  error_table <- data.table(NULL)
+  seed_no <- 0
+  for(alpha_param in alpha_array){
+    for(S in s_array){
+      for(e_param in e_array){
+      for(iter in 1:niter){
+        e <- round(p * e_param,0) #number of edges, Kurtz sets this to p for all simulations
+#        seed_no <- seed_no+1
+#        set.seed(seed_list[seed_no])
+        graph <- make_graph('cluster', p, e) #scale_free, cluster
+        Prec  <- graph2prec(graph,targetCondition=100) # Kurtz uses targetCondition=c(10,100)
+        Cor   <- cov2cor(prec2cov(Prec)) # the target R
+        median_Cor <- median(abs(Cor[lower.tri(Cor)]))
+        #median_Cor
+        frac_zero <- length(Cor[lower.tri(Cor)][abs(Cor[lower.tri(Cor)])<0.01])/length(Cor[lower.tri(Cor)])
+        #frac_zero
+        #round(Cor[1:10,1:10],3)
+        # hist(Cor[lower.tri(Cor)][(Cor[lower.tri(Cor)])!=0]) # plot cells in cor that are not zero
+        
+        N <- 5*10^2 # sample N
+        if(distribution=='lognorm'){microdat[microdat==0] <- 0.1}
+        # the goal here was to to compute a "true" R in the non-normal space but this didn't matter much so I'll keep the structure but just use N instead of some big number
+        X.sf <- synth_comm_from_counts(microdat, mar=2, distr=distribution, Sigma=Cor, n=bigN,retParams=FALSE) # the big N is to get a "true" R in the non-normal space with little sample error
+        X.sf <- round(X.sf,0)
+        R.true <- cor(X.sf) # "true" R in the non-normal space, makes sense only
+        X.sf <- X.sf[1:N,] # the sampled size-free X
+        R.sf <- cor(X.sf)
+        # the following three lines were used to compare the sampled and target correlations using the lognormal distribution. R.sf is the correlation of the lognormal data while R.logsf is the correlation of the log(data). The error in .sf is obviously much greater than the in .logsf. The point being that the other distributions like zinegbinom will be compared against a correlation that is in normal space so there will be large "sample" error that is not really sample error but error due to the correlation being computed in zinegbinom distributed space.
+        R.logsf <- cor(log(X.sf))
+        #err.sf <- error_from_correlation_matrix(R.sf,Cor)
+        #err.logsf <- error_from_correlation_matrix(R.logsf,Cor)
+        
+        params.sd <- apply(X.sf,2,sd)
+        params.mean <- apply(X.sf,2,mean)
+        
+        # how similar are simulated and real correlations?
+        #hist(R.microdat) # this could include size variation
+        #hist(R.sf[lower.tri(R.sf)])
+        #hist(R.sf[lower.tri(Cor)][(Cor[lower.tri(Cor)])!=0])
+        #stats
+        size <- apply(X.sf,1,sum)
+        fold.sf <- max(size)/min(size)
+        fold.sf
+        fold.microdat
+        
+        
+        # add General Size
+        alpha <- matrix(rep(alpha_param,p),nrow=1) # size effect
+        R.alpha <- t(alpha)%*%alpha
+        diag(R.alpha) <- 1
+        # random counts due to alpha
+        X.alpha <- synth_comm_from_counts(microdat, mar=2, distr=distribution, Sigma=R.alpha, n=N,retParams=FALSE)
+        # rescale X.alpha
+        #R.X_alpha <- cor(X.alpha)
+        #hist(R.X_alpha[lower.tri(R.X_alpha)])
+        #error.alpha <- error_from_correlation_matrix(cor(X.alpha),R.alpha)
+        #hist(error.alpha)
+        
+        # add counts
+        beta <- sqrt(1-alpha^2) # total effect of non-size factors
+        #X <- X.sf + X.alpha*alpha_param^2/(1-alpha_param^2)
+        X <- X.sf*(1-alpha_param^2) + X.alpha*alpha_param^2
+        
+        # add Protocol Size
+        protocol_size <- runif(N,1,S)
+        X <- round(X*protocol_size,0)
+        size <- apply(X,1,sum)
+        fold.X <- max(size)/min(size)
+
+        # Distance matrix
+        #D <- as.matrix(dist(decostand(X.sf, "norm")))
+        #D.sf <- D[lower.tri(D)]
+        #D <- as.matrix(dist(decostand(X, "norm")))
+        #D.X <- D[lower.tri(D)]
+
+        #Sim.sf <- sim.table(X.sf,q=0)
+        D <- as.matrix(vegdist(X.sf,method='morisita'))
+        D.sf <- D[lower.tri(D)]
+        D <- as.matrix(vegdist(X,method='morisita'))
+        D.X <- D[lower.tri(D)]
+       
+        if(do_network==TRUE){
+          se.est <- spiec.easi(X, method='mb', lambda.min.ratio=1e-2, nlambda=15)
+          auc <- huge.roc(se.est$path, graph)$AUC
+          res_table <- rbind(res_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,fold.sf=fold.sf,fold.X=fold.X,D_cor=vector_r(D.X,D.sf),Method='spiec_easi',AUC=auc))
+        }
+        
+        R.X <- cor(X)
+        R.logX <- cor(log(X+1))
+        if(is.element('pearson',do_methods)){
+        # sparcc
+          err <- error_from_correlation_matrix((R.logX),Cor)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)],Method='Pearson',Error=err))
+        }
+
+         if(is.element('samp',do_methods)){
+        # sparcc
+          err <- error_from_correlation_matrix(R.logsf,Cor)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)],Method='samp',Error=err))
+        }
+       
+        if(is.element('wfa1',do_methods)){
+          logX <- X
+          logX[logX==0] <- 0.1
+          logX <- log(logX)
+          wfa <- gwfa(logX,which_size='pc1',bc='wright')
+          R.wfa <- wfa$R_resid
+          err <- error_from_correlation_matrix(R.wfa,Cor)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)], Method='wfa1.logX.Ntrue',Error=err))
+
+          if(do_network==TRUE){
+            # create a size-free X
+            #X.sf_hat <- size_free_X(logX,R.wfa,do_cov=FALSE)
+            X.sf_hat <- round(exp(size_free_X(logX,R.wfa,do_cov=TRUE)),0)
+            se.est <- spiec.easi(X.sf_hat, method='mb', lambda.min.ratio=1e-2, nlambda=15)
+            auc <- huge.roc(se.est$path, graph)$AUC
+            D <- as.matrix(vegdist(X.sf_hat,method='morisita'))
+            D.X <- D[lower.tri(D)]
+            res_table <- rbind(res_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,fold.sf=fold.sf,fold.X=fold.X,D_cor=vector_r(D.X,D.sf),Method='wfa',AUC=auc))
+         }
+
+          wfa <- gwfa(X,which_size='pc1',bc='wright')
+          R.wfa <- wfa$R_resid
+          err <- error_from_correlation_matrix(R.wfa,R.true)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)], Method='wfa1.X.true',Error=err))
+          
+        }
+        
+        if(is.element('wfa2',do_methods)){
+      
+        # create fake size
+          added_alpha <- .7
+          R.alpha2 <- matrix(rep(added_alpha,p),ncol=1) %*% t(matrix(rep(added_alpha,p),ncol=1)) # size effect
+          diag(R.alpha2) <- 1.0
+          X.n <- t(apply(X, 1, norm_to_total))
+          X.cs <- round(X.n * min(depths))
+          X.alpha2 <- synth_comm_from_counts(X.cs, mar=2, distr=distribution, Sigma=R.alpha2, n=N,retParams=FALSE)
+          #X.alpha2 <- X + round(X.alpha2 * alpha_param^2/(1-alpha_param^2), 0)
+          X.alpha2 <- X*(1-alpha_param^2) + X.alpha2*alpha_param^2
+          wfa2 <- gwfa(X.alpha2,which_size='tss',bc='wright')
+          R.wfa2 <- wfa2$R_resid
+          err <- error_from_correlation_matrix(R.wfa2,Cor)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)], Method='wfa2',Error=err))
+          
+          if(do_network==TRUE){
+            e1.wfa <- wfa2$bc_alpha/sqrt(L[1])
+            E.wfa <- cbind(e1.wfa,E[,2:p])
+            X.wfa2 <- scores%*%t(E.wfa)
+            se.est <- spiec.easi(X.wfa2, method='mb', lambda.min.ratio=1e-2, nlambda=15)
+            auc <- huge.roc(se.est$path, graph)$AUC
+            res_table <- rbind(res_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,fold.sf=fold.sf,fold.X=fold.X,Method='wfa2',AUC=auc))
+            
+          }
+        }  
+        if(is.element('sparcc',do_methods)){
+        # sparcc
+          R_sparcc <- sparcc2(X,iter=5)$Cor
+          err <- error_from_correlation_matrix(R_sparcc,Cor)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)], Method='sparcc.Ntrue',Error=err))
+
+          err <- error_from_correlation_matrix(R_sparcc,R.true)
+          error_table <- rbind(error_table,data.table(seed=seed_no,alpha=alpha_param,e=e_param,S=S,R_true=Cor[lower.tri(Cor)], Method='sparcc.true',Error=err))
+        }
+
+      }
+      }
+    }
+  } 
+
+  exp <- paste(as.character(sample(LETTERS,4,replace=TRUE)),collapse='')
+  fn <- paste('error-',distribution,'-',exp,'.txt',sep='')
+  write.table(error_table,fn,quote=FALSE,sep='\t')
+  
+ # res_table[,list(AUC=mean(AUC)),by=list(alpha,S,e,Method)]
+
+  #error_table <- data.table(read.table('error-lognorm-CMKD.txt',header=TRUE,sep='\t'))
+  
+  error_table[,e:=factor(e)]
+  error_table[,S:=factor(S)]
+  error_table[,alpha:=factor(alpha)]
+  error_table[,Method:=factor(Method)]
+  gg <- ggplot(data=error_table[Method!='Pearson',],aes(x=e,y=Error,fill=Method))
+  gg <- gg + stat_summary(fun.data=boxplot.95,geom='boxplot',aes(fill=Method),position='dodge')
+  gg <- gg + coord_cartesian(ylim=c(-.25,.25))
+  gg <- gg + facet_grid(alpha~S, labeller=label_both)
+  gg
+
+  fileout <- paste('Fig-',distribution,'.all-cor.eps',sep='')
+  height <- 6
+  width <- 6
+  ggsave(fileout,width=width,height=height,dpi=300)
+
+ 
+  gg <- ggplot(data=error_table[abs(R_true)>0.01 & Method!='Pearson',],aes(x=e,y=Error,fill=Method))
+  gg <- gg + stat_summary(fun.data=boxplot.95,geom='boxplot',aes(fill=Method),position='dodge')
+  gg <- gg + facet_grid(alpha~S, labeller=label_both)
+  gg
+
+  fileout <- paste('Fig-',distribution,'.>01-cor.eps',sep='')
+  height <- 6
+  width <- 6
+  ggsave(fileout,width=width,height=height,dpi=300)
+
+
+}
+@
+
+
+
+\end{document}
